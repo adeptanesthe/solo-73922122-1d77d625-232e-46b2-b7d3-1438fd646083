@@ -19,6 +19,12 @@ MAX_DEPTH = 3
 N_FEATURES = 4
 TOTAL_GRAMS = 1000
 PROBA_THRESHOLD = 0.7          # 合格概率阈值
+# 每条实测记录的训练权重 = 合成记录权重的 20 倍
+MEASURED_WEIGHT = 20.0
+SYNTHETIC_WEIGHT = 1.0
+# 当班实测批次允许的记录条数
+MIN_MEASURED_RECORDS = 5
+MAX_MEASURED_RECORDS = 30
 # 概率复核的浮点容差：远小于该森林可取概率值之间的最小间隔（约 1e-4 量级），
 # 仅用于吸收 float64 求和顺序造成的尾数差异。
 PROBA_EPS = 1e-9
@@ -46,12 +52,61 @@ def make_synthetic_data(seed: int = TRAIN_SEED, n_samples: int = 6000):
     return X, y
 
 
-def train_model(seed: int = TRAIN_SEED) -> RandomForestClassifier:
+def validate_measured_batch(records) -> list[str]:
+    """校验当班实测批次：5~30 条、每条 4 个整数克数且总重 1000、标签为 0/1。"""
+    errs: list[str] = []
+    if not isinstance(records, (list, tuple)):
+        return ["records 必须是数组"]
+    n = len(records)
+    if not (MIN_MEASURED_RECORDS <= n <= MAX_MEASURED_RECORDS):
+        errs.append(f"实测记录条数须在 {MIN_MEASURED_RECORDS}~{MAX_MEASURED_RECORDS} 之间（当前 {n}）")
+        return errs
+    for idx, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            errs.append(f"第 {idx + 1} 条记录必须是对象")
+            continue
+        grams = rec.get("grams")
+        label = rec.get("label")
+        if not isinstance(grams, (list, tuple)) or len(grams) != N_FEATURES:
+            errs.append(f"第 {idx + 1} 条：用量必须是 {N_FEATURES} 个整数的数组")
+            continue
+        bad_gram = any(
+            (not isinstance(g, int)) or isinstance(g, bool) or g < 0 or g > TOTAL_GRAMS
+            for g in grams
+        )
+        if bad_gram:
+            errs.append(f"第 {idx + 1} 条：每种原料用量须为 0~{TOTAL_GRAMS} 的整数")
+        elif sum(grams) != TOTAL_GRAMS:
+            errs.append(f"第 {idx + 1} 条：总重须为 {TOTAL_GRAMS} 克（当前 {sum(grams)}）")
+        if not isinstance(label, int) or isinstance(label, bool) or label not in (0, 1):
+            errs.append(f"第 {idx + 1} 条：标签必须为 0 或 1")
+    return errs
+
+
+def train_model(seed: int = TRAIN_SEED, measured_records: list[dict] | None = None):
+    """按固定规格与种子训练随机森林。
+
+    measured_records 为 None 时仅使用固定合成训练集（启动基线，与历史版本完全一致）；
+    提供实测批次时，与固定合成训练集合并训练：合成记录权重 1，实测记录权重 20。
+    随机森林超参（5 棵树、深度 ≤ 3、random_state=固定种子）始终不变，
+    因此相同输入下重训结果确定可复现。
+    """
     X, y = make_synthetic_data(seed)
+    weights = np.full(len(X), SYNTHETIC_WEIGHT, dtype=np.float64)
+    if measured_records:
+        xm = np.array(
+            [[g / TOTAL_GRAMS for g in rec["grams"]] for rec in measured_records],
+            dtype=np.float32,
+        )
+        ym = np.array([int(rec["label"]) for rec in measured_records], dtype=np.int64)
+        wm = np.full(len(measured_records), MEASURED_WEIGHT, dtype=np.float64)
+        X = np.vstack([X, xm])
+        y = np.concatenate([y, ym])
+        weights = np.concatenate([weights, wm])
     clf = RandomForestClassifier(
         n_estimators=N_TREES, max_depth=MAX_DEPTH, random_state=seed
     )
-    clf.fit(X, y)
+    clf.fit(X, y, sample_weight=weights)
     return clf
 
 
@@ -106,7 +161,7 @@ def _leaf_prob1_exact(value_row: np.ndarray) -> Fraction:
     return Fraction(v1) / Fraction(total)
 
 
-def extract_forest(clf: RandomForestClassifier) -> ForestSpec:
+def extract_forest(clf: RandomForestClassifier, seed: int = TRAIN_SEED) -> ForestSpec:
     assert len(clf.estimators_) == N_TREES
     trees = []
     for est in clf.estimators_:
@@ -128,7 +183,7 @@ def extract_forest(clf: RandomForestClassifier) -> ForestSpec:
                 )
         trees.append(TreeSpec(nodes=tuple(nodes)))
     return ForestSpec(
-        trees=tuple(trees), n_trees=N_TREES, max_depth=MAX_DEPTH, seed=TRAIN_SEED
+        trees=tuple(trees), n_trees=N_TREES, max_depth=MAX_DEPTH, seed=seed
     )
 
 

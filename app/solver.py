@@ -7,6 +7,8 @@ K 由 model.cutoff_left 预计算。每份建议解出后都会用原 sklearn �
 """
 from __future__ import annotations
 
+import queue
+import threading
 import time
 from dataclasses import dataclass
 from fractions import Fraction
@@ -27,6 +29,41 @@ from .model import (
 )
 
 SOLVER_TIMEOUT_MS = 60_000
+
+# z3-solver 的 Python 绑定不仅共享进程级全局 context，还存在线程亲和性：
+# 即使加锁串行化，只要在不同线程里构造/求解 z3 对象，也可能破坏其线程本地
+# 状态（轻则 solver_failure，重则段错误，实测两种故障均复现过）。FastAPI 的
+# 同步端点跑在线程池中，因此这里用**单一专用 z3 工作线程 + 任务队列**承载
+# 全部 z3 调用（含样例构建期间的求解）；调用方线程只拿到纯 Python 结果。
+# 只读的 sklearn 概率复算不涉及 z3，仍在请求线程内执行。
+class _Z3Runner:
+    def __init__(self) -> None:
+        self._jobs: "queue.Queue" = queue.Queue()
+        self._worker = threading.Thread(
+            target=self._loop, name="z3-worker", daemon=True
+        )
+        self._worker.start()
+
+    def _loop(self) -> None:
+        while True:
+            fn, args, reply = self._jobs.get()
+            if fn is None:  # 关闭哨兵
+                return
+            try:
+                reply.put(("ok", fn(*args)))
+            except BaseException as exc:  # 含 z3.Z3Exception，回送调用线程重抛
+                reply.put(("err", exc))
+
+    def run(self, fn, *args):
+        reply: "queue.Queue" = queue.Queue()
+        self._jobs.put((fn, args, reply))
+        kind, payload = reply.get()
+        if kind == "err":
+            raise payload
+        return payload
+
+
+Z3_RUNNER = _Z3Runner()
 
 # 状态取值
 OK = "ok"                      # 已找到并证明最优
@@ -155,6 +192,46 @@ def _build_optimize(forest: ForestSpec, inp: SolveInput):
     return opt, g, num_changed, total_change
 
 
+def _z3_solve_core(forest: ForestSpec, inp: SolveInput, t0: float) -> SolveResult:
+    """全部 z3 工作：必须运行在专用 z3 工作线程上。
+
+    返回：
+      ("infeasible", SolveResult) / ("failure", SolveResult) /
+      ("sat", suggestion, best_k, best_delta, elapsed_ms)
+    """
+    opt, g, num_changed, total_change = _build_optimize(forest, inp)
+    # 阶段 1：最少改变原料种数
+    h1 = opt.minimize(num_changed)
+    r1 = opt.check()
+    if r1 == z3.unsat:
+        return ("infeasible", SolveResult(
+            status=INFEASIBLE,
+            reason="求解器已证明：在当前上下限与锁定条件下，不存在合格概率 ≥ 0.7 的配方。",
+            solve_ms=(time.perf_counter() - t0) * 1000,
+        ))
+    if r1 != z3.sat:
+        return ("failure", SolveResult(
+            status=SOLVER_FAILURE,
+            reason=f"求解器未能判定（{r1}，可能超时），既未找到方案也未证明无解。",
+            solve_ms=(time.perf_counter() - t0) * 1000,
+        ))
+    best_k = opt.lower(h1).as_long()
+    # 阶段 2：在种数最优的前提下最小化总克数改变量
+    opt.add(num_changed == best_k)
+    h2 = opt.minimize(total_change)
+    r2 = opt.check()
+    if r2 != z3.sat:
+        return ("failure", SolveResult(
+            status=SOLVER_FAILURE,
+            reason=f"第二阶段求解未能判定（{r2}）。",
+            solve_ms=(time.perf_counter() - t0) * 1000,
+        ))
+    best_delta = opt.lower(h2).as_long()
+    m = opt.model()
+    sug = [m.eval(g[i]).as_long() for i in range(N_FEATURES)]
+    return ("sat", sug, best_k, best_delta, (time.perf_counter() - t0) * 1000)
+
+
 def solve(forest: ForestSpec, clf, inp: SolveInput) -> SolveResult:
     """两阶段字典序求解；只有 z3 证明 unsat 才报无解。"""
     t0 = time.perf_counter()
@@ -162,42 +239,17 @@ def solve(forest: ForestSpec, clf, inp: SolveInput) -> SolveResult:
     if errs:
         return SolveResult(status=INVALID, reason="；".join(errs))
     try:
-        opt, g, num_changed, total_change = _build_optimize(forest, inp)
-        # 阶段 1：最少改变原料种数
-        h1 = opt.minimize(num_changed)
-        r1 = opt.check()
-        if r1 == z3.unsat:
-            return SolveResult(
-                status=INFEASIBLE,
-                reason="求解器已证明：在当前上下限与锁定条件下，不存在合格概率 ≥ 0.7 的配方。",
-                solve_ms=(time.perf_counter() - t0) * 1000,
-            )
-        if r1 != z3.sat:
-            return SolveResult(
-                status=SOLVER_FAILURE,
-                reason=f"求解器未能判定（{r1}，可能超时），既未找到方案也未证明无解。",
-                solve_ms=(time.perf_counter() - t0) * 1000,
-            )
-        best_k = opt.lower(h1).as_long()
-        # 阶段 2：在种数最优的前提下最小化总克数改变量
-        opt.add(num_changed == best_k)
-        h2 = opt.minimize(total_change)
-        r2 = opt.check()
-        if r2 != z3.sat:
-            return SolveResult(
-                status=SOLVER_FAILURE,
-                reason=f"第二阶段求解未能判定（{r2}）。",
-                solve_ms=(time.perf_counter() - t0) * 1000,
-            )
-        best_delta = opt.lower(h2).as_long()
-        m = opt.model()
-        sug = [m.eval(g[i]).as_long() for i in range(N_FEATURES)]
+        # 所有 z3 构造与 check 都在单一专用工作线程执行，规避线程亲和性崩溃
+        outcome = Z3_RUNNER.run(_z3_solve_core, forest, inp, t0)
     except z3.Z3Exception as exc:  # 求解器异常：与“无解”严格区分
         return SolveResult(
             status=SOLVER_FAILURE,
             reason=f"求解器异常：{exc}",
             solve_ms=(time.perf_counter() - t0) * 1000,
         )
+    if outcome[0] in ("infeasible", "failure"):
+        return outcome[1]
+    _, sug, best_k, best_delta, elapsed = outcome
 
     # ---- 用原分类器复算每份建议 ----
     proba = predict_proba_qualified(clf, sug)

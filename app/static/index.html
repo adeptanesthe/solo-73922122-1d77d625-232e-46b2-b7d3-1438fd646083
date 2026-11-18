@@ -50,6 +50,7 @@
 <header>
   <h1>再生塑料配方试配筛选</h1>
   <p id="metaLine">质检模型加载中…</p>
+  <p style="margin:6px 0 0;font-size:12.5px"><a href="/update" style="color:#bfe6c9">→ 前往「当班模型更新」页面</a></p>
 </header>
 <main>
   <section>
@@ -102,6 +103,8 @@
 const TOTAL = 1000;
 let featureNames = ["原料1","原料2","原料3","原料4"];
 let samples = null;
+// 当前页面所依据的模型版次；版次变化（发布新版本）等同输入修改：立即撤下旧建议
+let currentModelVersion = null;
 
 // ---- 结果撤回机制：epoch + AbortController ----
 // 任何输入修改都会令 epoch 递增、中止在途请求并立即清空旧建议；
@@ -205,8 +208,46 @@ async function solve() {
   }
   $("solveBtn").disabled = false;
   if (my !== epoch) return;                // 迟到结果：丢弃，不恢复
+  // 版次防护：响应若来自与当前版次不同的模型快照，也不得作为当前建议显示
+  if (data.model_version != null && data.model_version !== currentModelVersion) {
+    withdraw("服务端模型版次已变化（v" + data.model_version + "），该旧版响应不予显示。");
+    refreshModelContext();
+    return;
+  }
   renderResult(data);
 }
+
+// 发布新版本后立即撤下旧建议：中止在途请求、作废 epoch、清空结果区
+function withdraw(reason) {
+  epoch++;
+  if (inflight) { inflight.abort(); inflight = null; }
+  $("solveBtn").disabled = false;
+  hidePanels();
+  $("status").textContent = reason + " 请重新求解。";
+}
+
+// 轮询模型版次：发布页面提交后，本页无需刷新即可感知新版并撤下旧建议；
+// 同时刷新与模型绑定的样例与版次信息。
+async function refreshModelContext() {
+  try {
+    const meta = await fetch("/api/meta").then(r => r.json());
+    featureNames = meta.feature_names;
+    buildGrid();
+    $("metaLine").textContent =
+      `当前模型 v${meta.version}（${meta.created_at}）：随机森林 ${meta.n_trees} 棵树 / 深度 ≤ ${meta.max_depth}` +
+      `（实际深度 ${meta.tree_depths.join(",")}），固定种子 ${meta.train_seed} 训练；` +
+      `实测记录 ${meta.n_measured} 条（权重 ×${meta.measured_weight}）；` +
+      `合格阈值 概率 ≥ ${meta.proba_threshold}；总重 ${meta.total_grams} 克。`;
+    const smp = await fetch("/api/samples").then(r => r.json());
+    samples = smp;
+    if (currentModelVersion !== null && meta.version !== currentModelVersion) {
+      withdraw(`检测到新版本 v${meta.version} 已发布，旧版建议已撤下。`);
+    }
+    currentModelVersion = meta.version;
+  } catch (e) { /* 轮询失败不影响页面操作，下个周期再试 */ }
+}
+// 浏览器中周期轮询版次；非浏览器环境（如 DOM 打桩测试）不启动定时器
+if (typeof window !== "undefined") setInterval(refreshModelContext, 3000);
 
 function renderResult(d) {
   if (d.status === "ok") {
@@ -248,10 +289,13 @@ async function boot() {
   ]);
   samples = smp;
   featureNames = meta.feature_names;
+  currentModelVersion = meta.version;
   buildGrid();
   $("metaLine").textContent =
-    `质检模型：随机森林 ${meta.n_trees} 棵树 / 深度 ≤ ${meta.max_depth}（实际深度 ${meta.tree_depths.join(",")}），` +
-    `固定种子 ${meta.train_seed} 训练；合格阈值 概率 ≥ ${meta.proba_threshold}；总重 ${meta.total_grams} 克。`;
+    `当前模型 v${meta.version}（${meta.created_at}）：随机森林 ${meta.n_trees} 棵树 / 深度 ≤ ${meta.max_depth}` +
+    `（实际深度 ${meta.tree_depths.join(",")}），固定种子 ${meta.train_seed} 训练；` +
+    `实测记录 ${meta.n_measured} 条（权重 ×${meta.measured_weight}）；` +
+    `合格阈值 概率 ≥ ${meta.proba_threshold}；总重 ${meta.total_grams} 克。`;
   fillForm(samples.feasible);
   $("solveBtn").onclick = solve;
   $("feasibleBtn").onclick = () => fillForm(samples.feasible);

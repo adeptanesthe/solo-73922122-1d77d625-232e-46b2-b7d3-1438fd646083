@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>当班试配模型更新</title>
+<style>
+  :root { --ink:#1f2933; --muted:#6b7280; --line:#d8dee6; --ok:#0f7b3d; --bad:#b42318; --warn:#9a6700; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif; color:var(--ink); background:var(--bg); }
+  header { background:#0b3d2e; color:#fff; padding:14px 22px; }
+  header h1 { margin:0; font-size:19px; }
+  header p { margin:4px 0 0; font-size:12.5px; opacity:.85; }
+  header a { color:#bfe6c9; }
+  main { max-width: 1060px; margin: 18px auto 60px; padding: 0 16px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  table { border-collapse: collapse; width:100%; }
+  th, td { padding:7px 8px; text-align:center; font-size:13.5px; }
+  th { color:var(--muted); font-weight:600; border-bottom:2px solid var(--line); }
+  td { border-bottom:1px solid #eef1f4; }
+  input[type=number] { width:84px; padding:5px 6px; border:1px solid var(--line); border-radius:6px; font-size:13.5px; text-align:right; }
+  input[type=number]:focus { outline:2px solid #0b3d2e33; border-color:#0b3d2e; }
+  input.invalid { outline:2px solid #b4231855; border-color:var(--bad); }
+  select { padding:5px 6px; border:1px solid var(--line); border-radius:6px; font-size:13.5px; }
+  .sumline { margin-top:10px; font-size:13px; color:var(--muted); }
+  .sumline b.bad { color:var(--bad); }
+  .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+  button { padding:9px 18px; border-radius:8px; border:1px solid #0b3d2e; background:#0b3d2e; color:#fff; font-size:14px; cursor:pointer; }
+  button.ghost { background:#fff; color:#0b3d2e; }
+  button.danger { border-color:var(--bad); background:var(--bad); }
+  button:disabled { opacity:.55; cursor:default; }
+  #status { min-height: 26px; font-size:13.5px; margin: 10px 0 2px; color:var(--muted); }
+  #status .spin { display:inline-block; width:13px; height:13px; border:2px solid #0b3d2e33; border-top-color:#0b3d2e; border-radius:50%; animation:sp 0.8s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .panel { border-radius:10px; padding:14px 16px; margin-top:10px; font-size:13.5px; display:none; }
+  .panel.ok { display:block; background:#eefaf1; border:1px solid #bfe6c9; }
+  .panel.failure { display:block; background:#fdf6e4; border:1px solid #ecd9a0; }
+  .panel.invalid { display:block; background:#fdf0ee; border:1px solid #f2c7c1; }
+  .panel h3 { margin:0 0 8px; font-size:14.5px; }
+  .panel.ok h3 { color:var(--ok); } .panel.failure h3 { color:var(--warn); } .panel.invalid h3 { color:var(--bad); }
+  .kv { margin:3px 0; }
+  .kv b { font-weight:600; }
+  .note { font-size:12.5px; color:var(--muted); margin-top:8px; line-height:1.7; }
+  code { background:#eef1f4; padding:1px 5px; border-radius:4px; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600; }
+  .pill.run { background:#fdf6e4; color:var(--warn); border:1px solid #ecd9a0; }
+  .pill.idle { background:#eef1f4; color:var(--muted); border:1px solid var(--line); }
+  ul.errs { margin:6px 0 0; padding-left:18px; color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>当班试配模型更新</h1>
+  <p>录入 5～30 条已检四料配方（总重 1000 克整数用量）与实测 0/1 标签，整体替换上次实测批次后按原规格与种子重训。</p>
+  <p style="margin-top:6px"><a href="/">← 返回「配方试配」页面（原试配入口保留）</a></p>
+</header>
+<main>
+  <section>
+    <h2>1. 当前模型与更新状态</h2>
+    <div class="kv" id="curLine">加载中…</div>
+    <div class="kv" id="batchLine"></div>
+    <div class="kv" id="updLine"></div>
+  </section>
+
+  <section>
+    <h2>2. 当班实测批次（提交后整体替换上次实测批次）</h2>
+    <table id="grid">
+      <thead>
+        <tr><th>#</th><th>再生PP（克）</th><th>再生PE（克）</th><th>矿物填料（克）</th><th>功能助剂（克）</th><th>总重</th><th>实测标签</th><th></th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="btns">
+      <button class="ghost" id="addBtn" type="button">+ 增加一条</button>
+      <button class="ghost" id="fillDemoBtn" type="button">填入示例批次（6 条，须自行核对）</button>
+      <button class="danger" id="clearBtn" type="button">清空为 5 行</button>
+      <button id="submitBtn" type="button">校验并重训发布</button>
+    </div>
+    <div class="note">
+      规则：记录条数 5～30；每条 4 个原料均为 0～1000 的整数且总重恰为 1000 克；标签 1=合格、0=不合格。
+      重训使用与原模型完全相同的随机森林规格（5 棵树、深度 ≤ 3）与固定种子；合成记录权重 1，
+      每条实测记录权重 <b>20</b>。候选分类器、供 z3 的树结构、可行/无解样例<b>全部就绪后才发布新版</b>；
+      任何一步失败，旧版模型及其所用实测批次继续可用，试配页旧版求解不受影响。
+    </div>
+  </section>
+
+  <section>
+    <h2>3. 更新结果</h2>
+    <div id="status">尚未提交。</div>
+    <div class="panel ok" id="panelOk">
+      <h3>新版本已发布</h3>
+      <div class="kv" id="okDetail"></div>
+    </div>
+    <div class="panel failure" id="panelFailure">
+      <h3>更新失败（旧版继续可用）</h3>
+      <div class="kv" id="failureDetail"></div>
+    </div>
+    <div class="panel invalid" id="panelInvalid">
+      <h3>输入不合法，未开始重训</h3>
+      <ul class="errs" id="invalidErrs"></ul>
+    </div>
+  </section>
+</main>
+
+<script>
+const TOTAL = 1000, MIN_ROWS = 5, MAX_ROWS = 30;
+const $ = id => document.getElementById(id);
+let submitting = false;
+
+function rowHtml(i) {
+  return `<tr data-row="${i}">` +
+    `<td class="ridx">${i + 1}</td>` +
+    [0,1,2,3].map(j => `<td><input type="number" class="g g${j}" min="0" max="${TOTAL}" step="1"></td>`).join("") +
+    `<td class="rowsum">—</td>` +
+    `<td><select class="lab"><option value="1">1 合格</option><option value="0">0 不合格</option></select></td>` +
+    `<td><button type="button" class="ghost delBtn">删除</button></td>` +
+    `</tr>`;
+}
+
+function rebuildRows(n) {
+  const tbody = $("grid").querySelector("tbody");
+  tbody.innerHTML = "";
+  for (let i = 0; i < n; i++) tbody.insertAdjacentHTML("beforeend", rowHtml(i));
+  refreshRowState();
+}
+
+function refreshRowState() {
+  const rows = [...$("grid").querySelector("tbody").rows];
+  rows.forEach((tr, i) => {
+    tr.querySelector(".ridx").textContent = i + 1;
+    let sum = 0, bad = false;
+    tr.querySelectorAll(".g").forEach(inp => {
+      const s = inp.value.trim();
+      const v = s === "" ? NaN : Number(s);
+      if (!Number.isInteger(v) || v < 0 || v > TOTAL) { bad = true; inp.classList.add("invalid"); }
+      else { inp.classList.remove("invalid"); sum += v; }
+    });
+    const cell = tr.querySelector(".rowsum");
+    cell.textContent = bad ? "非法" : sum;
+    cell.style.color = (!bad && sum !== TOTAL) ? "var(--bad)" : "";
+  });
+  $("addBtn").disabled = rows.length >= MAX_ROWS || submitting;
+  $("submitBtn").disabled = submitting;
+}
+
+function collectRecords() {
+  const errs = [], records = [];
+  const rows = [...$("grid").querySelector("tbody").rows];
+  if (rows.length < MIN_ROWS || rows.length > MAX_ROWS)
+    errs.push(`记录条数须在 ${MIN_ROWS}～${MAX_ROWS} 之间（当前 ${rows.length}）`);
+  rows.forEach((tr, i) => {
+    const grams = [];
+    let rowBad = false;
+    tr.querySelectorAll(".g").forEach(inp => {
+      const s = inp.value.trim();
+      const v = s === "" ? NaN : Number(s);
+      if (!Number.isInteger(v) || v < 0 || v > TOTAL) rowBad = true;
+      grams.push(v);
+    });
+    if (rowBad) { errs.push(`第 ${i + 1} 条：4 个原料用量均须为 0～${TOTAL} 的整数`); return; }
+    const sum = grams.reduce((a, b) => a + b, 0);
+    if (sum !== TOTAL) { errs.push(`第 ${i + 1} 条：总重须为 ${TOTAL} 克（当前 ${sum}）`); return; }
+    const label = Number(tr.querySelector(".lab").value);
+    if (label !== 0 && label !== 1) { errs.push(`第 ${i + 1} 条：标签必须为 0 或 1`); return; }
+    records.push({ grams, label });
+  });
+  return { errs, records };
+}
+
+function hidePanels() {
+  for (const id of ["panelOk","panelFailure","panelInvalid"]) $(id).style.display = "none";
+}
+function showPanel(id) { hidePanels(); $(id).style.display = "block"; }
+
+async function submitUpdate() {
+  if (submitting) return;
+  const { errs, records } = collectRecords();
+  if (errs.length) {
+    $("invalidErrs").innerHTML = errs.map(e => `<li>${e}</li>`).join("");
+    showPanel("panelInvalid");
+    $("status").textContent = "客户端校验未通过，未向服务端提交。";
+    return;
+  }
+  submitting = true;
+  refreshRowState();
+  hidePanels();
+  $("status").innerHTML = '<span class="spin"></span>重训中：固定合成训练集 + 本批实测（权重 ×20），并重建 z3 树结构与样例；期间试配页旧版求解照常…';
+  try {
+    const resp = await fetch("/api/model/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ records }),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      const m = data.model.current;
+      $("okDetail").innerHTML =
+        `<div class="kv">${data.message}</div>` +
+        `<div class="kv">版次：<b>v${m.version}</b>；发布时间：${m.created_at}；重训耗时：${m.train_seconds} s</div>` +
+        `<div class="kv">实测批次：<b>${m.n_measured}</b> 条（标签 0：${m.label_counts["0"]} 条，标签 1：${m.label_counts["1"]} 条），每条权重 ×${m.measured_weight}</div>`;
+      showPanel("panelOk");
+      $("status").textContent = "更新成功，新版本已成为当前服务模型。";
+    } else {
+      $("failureDetail").textContent = (data && data.detail) ? data.detail : ("HTTP " + resp.status);
+      showPanel("panelFailure");
+      $("status").textContent = "更新失败，旧版模型继续可用。";
+    }
+  } catch (e) {
+    $("failureDetail").textContent = "请求失败：" + e.message + "（旧版模型不受影响，继续可用）";
+    showPanel("panelFailure");
+    $("status").textContent = "更新请求异常，旧版模型继续可用。";
+  } finally {
+    submitting = false;
+    refreshRowState();
+    loadStatus();
+  }
+}
+
+async function loadStatus() {
+  let st;
+  try { st = await fetch("/api/model/status").then(r => r.json()); }
+  catch (e) { $("curLine").textContent = "状态加载失败：" + e.message; return; }
+  const c = st.current;
+  $("curLine").innerHTML =
+    `当前模型：<b>v${c.version}</b>（${c.created_at}，重训 ${c.train_seconds} s）` +
+    `　<span class="pill ${st.updating ? "run" : "idle"}">${st.updating ? "更新在途" : "空闲"}</span>`;
+  $("batchLine").innerHTML = c.n_measured === 0
+    ? "当前版次所用实测批次：<b>无</b>（启动基线，仅固定合成训练集）"
+    : `当前版次所用实测批次：<b>${c.n_measured}</b> 条（标签 0：${c.label_counts["0"]}，标签 1：${c.label_counts["1"]}），每条权重 ×${c.measured_weight}；下次提交将整体替换该批次。`;
+  if (st.last_update) {
+    const u = st.last_update;
+    $("updLine").innerHTML = u.state === "success"
+      ? `上次更新：<b style="color:var(--ok)">成功</b> → v${u.version}（${u.at}，${u.n_records} 条记录）`
+      : `上次更新：<b style="color:var(--bad)">失败</b>（${u.at}），旧版 v${u.version} 保留；原因：${u.error}`;
+  } else {
+    $("updLine").textContent = "尚无更新记录（当前为启动基线 v1）。";
+  }
+}
+
+function bindGrid() {
+  const tbody = $("grid").querySelector("tbody");
+  tbody.addEventListener("input", refreshRowState);
+  tbody.addEventListener("change", refreshRowState);
+  tbody.addEventListener("click", (ev) => {
+    if (!ev.target.classList.contains("delBtn")) return;
+    const rows = [...tbody.rows];
+    if (rows.length <= MIN_ROWS) { $("status").textContent = `至少保留 ${MIN_ROWS} 条记录。`; return; }
+    ev.target.closest("tr").remove();
+    refreshRowState();
+  });
+  $("addBtn").onclick = () => {
+    if ([...tbody.rows].length >= MAX_ROWS) return;
+    tbody.insertAdjacentHTML("beforeend", rowHtml(tbody.rows.length));
+    refreshRowState();
+  };
+  $("clearBtn").onclick = () => rebuildRows(MIN_ROWS);
+  $("fillDemoBtn").onclick = () => {
+    // 仅为页面操作示例：6 条总重 1000 的整数配方与标签，提交前须由质检工程师核对
+    const demo = [
+      [[620, 180, 120, 80], 1], [[580, 220, 130, 70], 1], [[550, 250, 140, 60], 1],
+      [[180, 140, 560, 120], 0], [[150, 130, 620, 100], 0], [[220, 160, 520, 100], 0],
+    ];
+    rebuildRows(demo.length);
+    [...tbody.rows].forEach((tr, i) => {
+      tr.querySelectorAll(".g").forEach((inp, j) => { inp.value = demo[i][0][j]; });
+      tr.querySelector(".lab").value = String(demo[i][1]);
+    });
+    refreshRowState();
+  };
+  $("submitBtn").onclick = submitUpdate;
+}
+
+async function boot() {
+  rebuildRows(MIN_ROWS);
+  bindGrid();
+  await loadStatus();
+  // 浏览器中周期轮询状态；非浏览器环境（如 DOM 打桩测试）不启动定时器
+  if (typeof window !== "undefined") setInterval(loadStatus, 3000);
+}
+boot().catch(e => { $("status").textContent = "初始化失败：" + e.message; });
+</script>
+</body>
+</html>
